@@ -26,7 +26,7 @@ No Sandbox buyer credentials are bundled. The submitter must supply a dedicated 
 
 ## Tests and verification boundary
 
-Run `node --test tests/*.test.mjs` and `python -m unittest test_ai_service`. Thirteen Node tests and four Python validation tests passed in the development environment. Live checks covered resume options, Adzuna listings, Study Road generation, checkout creation and unauthenticated member rejection. Restart persistence uses simulated PayPal responses. Active buyer approval and the complete active-member cycle remain acceptance gates; do not represent them as already passed.
+Run `node --test tests/*.test.mjs` and `python -m unittest test_ai_service test_study_service`. Thirteen Node tests and seven Python validation tests passed in the development environment. Live checks covered resume options, Adzuna listings, Study Road generation, checkout creation and unauthenticated member rejection. Restart persistence uses simulated PayPal responses. Active buyer approval and the complete active-member cycle remain acceptance gates; do not represent them as already passed.
 
 ## Architecture and privacy
 

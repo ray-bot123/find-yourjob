@@ -6,5 +6,5 @@ Enter the values from your local configuration in the Render dashboard. Map ai.l
 
 After deployment, open /#/discover from a clean browser and run Try a sample resume, confirm, analyze, choose preferences and verify that a live listing loads. Test the Study Road and PayPal Sandbox with a dedicated test buyer. Provide judge-only test buyer access through the submission's testing instructions. Do not post payment credentials in the public repository.
 
-This is a deployment configuration. It has not yet been built or deployed on Render.
+The public deployment is https://find-yourjob.onrender.com/. On November 12, 2026, the homepage, AI configuration status and PayPal plan terms returned HTTP 200. This does not verify buyer approval or guarantee continued uptime. Keep judge access available through December 15, 2026 at 08:00 PST.
 
