@@ -1,11 +1,38 @@
 import { siteOrigin } from './member-proxy.mjs';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHmac, timingSafeEqual } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { readFile } from 'node:fs/promises';
 import { readFileSync, writeFileSync, renameSync } from 'node:fs';
 
 const base = 'https://api-m.sandbox.paypal.com';
 const configPath = new URL('./paypal.local.json',import.meta.url);
+
+// A signed, browser-held association survives ephemeral host restarts. It is
+// never proof of membership: every status/member request still checks PayPal.
+const recoveryLifetime = 60 * 24 * 60 * 60;
+function signAssociation(config, origin, value) {
+  return createHmac('sha256', config.client_secret)
+    .update('fyj-checkout-v1\n'+config.client_id+'\n'+config.plan_id+'\n'+origin+'\n'+value).digest('base64url');
+}
+function recoveryCookie(config, origin, id, session) {
+  const payload = Buffer.from(JSON.stringify({id, subscription:session.subscription,
+    expires:Math.floor(Date.now()/1000)+recoveryLifetime})).toString('base64url');
+  return id+'.'+payload+'.'+signAssociation(config,origin,payload);
+}
+function recoverAssociation(config, origin, cookie) {
+  try {
+    if (!cookie || cookie.length>2048) return null;
+    const [id,payload,signature,...extra]=cookie.split('.');
+    if (extra.length || !/^[a-f0-9-]{36}$/.test(id) || !payload || !signature) return null;
+    const expected=Buffer.from(signAssociation(config,origin,payload));
+    const received=Buffer.from(signature);
+    if (expected.length!==received.length || !timingSafeEqual(expected,received)) return null;
+    const data=JSON.parse(Buffer.from(payload,'base64url').toString('utf8'));
+    if (data.id!==id || !/^I-[A-Z0-9]+$/.test(data.subscription) ||
+        !Number.isSafeInteger(data.expires) || data.expires<=Date.now()/1000) return null;
+    return data;
+  } catch {return null;}
+}
 
 async function readConfig() {
   const hosted = {client_id:process.env.FYJ_PAYPAL_CLIENT_ID,client_secret:process.env.FYJ_PAYPAL_CLIENT_SECRET,plan_id:process.env.FYJ_PAYPAL_PLAN_ID};
@@ -64,21 +91,39 @@ export function createPayPalHandler({loadConfig=readConfig,fetchApi=fetch,sessio
     if (!origin || (req.headers.origin && req.headers.origin!==origin)) return send(403,{error:'Invalid checkout origin.'});
     if (['/api/paypal/start','/api/paypal/reset'].includes(path) && (req.method!=='POST' || req.headers.origin!==origin)) return send(403,{error:'Start checkout from find yourjob.'});
     if (!['/api/paypal/start','/api/paypal/reset'].includes(path) && req.method!=='GET') return send(405,{error:'Method not allowed.'});
-    const sessionId = /(?:^|;\s*)fyj_checkout=([a-f0-9-]{36})(?:;|$)/.exec(req.headers.cookie||'')?.[1];
-    const session = sessions.get(sessionId);
+    const cookie = /(?:^|;\s*)fyj_checkout=([^;]+)(?:;|$)/.exec(req.headers.cookie||'')?.[1];
+    const sessionId = /^([a-f0-9-]{36})(?:\.|$)/.exec(cookie||'')?.[1];
+    let session = sessions.get(sessionId);
     if (path==='/api/paypal/reset') {
-      sessions.delete(sessionId);
+      if (sessionId) sessions.set(sessionId,{revoked:true});
       persist();
       return send(200,{reset:true},{'Set-Cookie':'fyj_checkout=; Max-Age=0; HttpOnly; SameSite=Lax; Path=/'});
     }
     const config = await loadConfig();
     if (path==='/api/paypal/config') return send(200,{configured:Boolean(config)});
     if (!config) return send(503,{error:'PayPal sandbox has not been configured.'});
+    if (origin.startsWith('https:') && cookie?.includes('.')) {
+      const recovered = recoverAssociation(config,origin,cookie);
+      if (!recovered) session=undefined;
+      else if (!session) {
+        session={subscription:recovered.subscription,busy:false,signed:true};
+        sessions.set(recovered.id,session);
+      }
+    }
+    if (origin.startsWith('https:') && session?.signed && !cookie?.includes('.')) session=undefined;
+    const setAssociation = (id,value) => {
+      if (origin.startsWith('https:') && value.subscription) value.signed=true;
+      const token=origin.startsWith('https:') && value.subscription
+        ? recoveryCookie(config,origin,id,value) : id;
+      res.setHeader('Set-Cookie','fyj_checkout='+token+'; Max-Age='+recoveryLifetime+
+        '; HttpOnly; SameSite=Lax; Path=/'+(origin.startsWith('https:')?'; Secure':''));
+    };
     try {
       if (path==='/api/paypal/status') {
         if (!session?.subscription) return send(200,{active:false,status:'NOT_STARTED'});
         const details = await paypal(config,'/v1/billing/subscriptions/'+session.subscription);
         const active = details.id===session.subscription && details.plan_id===config.plan_id && details.status==='ACTIVE';
+        if (active) setAssociation(sessionId,session);
         return send(200,{active,status:details.status});
       }
       if (path==='/api/paypal/terms') {
@@ -96,7 +141,12 @@ export function createPayPalHandler({loadConfig=readConfig,fetchApi=fetch,sessio
         if (details.plan_id===config.plan_id && ['ACTIVE','APPROVED'].includes(details.status)) {
           return send(409,{error:'A subscription already exists. Verify it to continue.'});
         }
-        if (details.plan_id===config.plan_id && details.status==='APPROVAL_PENDING') return send(200,{approval:session.approval});
+        if (details.plan_id===config.plan_id && details.status==='APPROVAL_PENDING') {
+          const approval = new URL(session.approval || details.links?.find(link=>link.rel==='approve')?.href);
+          if (approval.protocol!=='https:' || approval.host!=='www.sandbox.paypal.com') throw new Error('Invalid approval URL');
+          setAssociation(sessionId,session);
+          return send(200,{approval:approval.href});
+        }
       }
       const id = sessionId && session ? sessionId : randomUUID();
       const current = {busy:true,requestId:session?.subscription ? randomUUID() : session?.requestId || randomUUID()};
@@ -115,6 +165,8 @@ export function createPayPalHandler({loadConfig=readConfig,fetchApi=fetch,sessio
         if (approval.protocol!=='https:' || approval.host!=='www.sandbox.paypal.com' ||
             !/^I-[A-Z0-9]+$/.test(result.id)) throw new Error('Invalid sandbox approval response.');
         Object.assign(current,{subscription:result.id,approval:approval.href});
+        persist();
+        setAssociation(id,current);
         persist();
         return send(200,{approval:approval.href});
       } finally {
